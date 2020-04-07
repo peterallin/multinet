@@ -11,7 +11,66 @@ use std::sync::Arc;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Sender<T> = futures::channel::mpsc::UnboundedSender<T>;
 type Receiver<T> = futures::channel::mpsc::UnboundedReceiver<T>;
-type State = HashMap<SocketAddr, (i64, Sender<ClientMessage>)>;
+
+#[derive(Clone)]
+struct State {
+    clients: HashMap<SocketAddr, (i64, Sender<ClientMessage>)>,
+}
+
+impl State {
+    fn new() -> Self {
+        State {
+            clients: HashMap::new(),
+        }
+    }
+
+    fn add_client(&mut self, address: SocketAddr, sender: Sender<ClientMessage>) {
+        self.clients.insert(address, (0, sender));
+    }
+
+    fn remove_client(&mut self, address: &SocketAddr) {
+        self.clients.remove(address);
+    }
+
+    fn set_client_number(&mut self, client_address: &SocketAddr, new_number: i64) {
+        self.clients
+            .entry(*client_address)
+            .and_modify(|e| e.0 = new_number);
+    }
+
+    async fn send_error_to_client(
+        &mut self,
+        client_address: &SocketAddr,
+        message: &str,
+    ) -> Result<()> {
+        if let Some(client) = self.clients.get_mut(client_address) {
+            let message = message.to_string();
+            client.1.send(ClientMessage::Error { message }).await?;
+        }
+        Ok(())
+    }
+
+    async fn distribute(&self) -> Result<()> {
+        for client_state in self.clients.clone().values_mut() {
+            client_state
+                .1
+                .send(ClientMessage::StateUpdate {
+                    new_state: self.clone(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for (key, value) in &self.clients {
+            writeln!(f, "{} -> {}", key, value.0)?;
+        }
+        Ok(())
+    }
+}
 
 enum ClientMessage {
     StateUpdate { new_state: State },
@@ -87,12 +146,13 @@ async fn client_sender_loop(
 ) -> Result<()> {
     let mut counter: i32 = 0;
     let mut stream = &*stream;
+
     while let Some(update) = receiver.next().await {
         match update {
             ClientMessage::StateUpdate { new_state } => {
                 let s = format!("Update #{}:\n", counter);
                 stream.write(s.as_bytes()).await?;
-                let s = state_to_string(&new_state);
+                let s = new_state.to_string();
                 stream.write(s.as_bytes()).await?;
             }
             ClientMessage::Error { message } => {
@@ -108,56 +168,34 @@ async fn client_sender_loop(
 }
 
 async fn state_keeper_loop(mut receiver: Receiver<StateKeeperMessage>) -> Result<()> {
-    let mut state: State = HashMap::new();
+    let mut state = State::new();
 
     while let Some(message) = receiver.next().await {
         match message {
             StateKeeperMessage::NewClient { stream, sender } => {
-                state.insert(stream.peer_addr()?, (0, sender));
-                distribute_state(&state).await?;
+                state.add_client(stream.peer_addr()?, sender);
+                state.distribute().await?;
             }
             StateKeeperMessage::ClientGone { address } => {
-                state.remove(&address);
-                distribute_state(&state).await?;
+                state.remove_client(&address);
+                state.distribute().await?;
             }
             StateKeeperMessage::Message { source, text } => {
-                let mut client_sender = state.get(&source).unwrap().1.clone();
                 match text.trim().parse() {
                     Ok(new_number) => {
-                        state.insert(source, (new_number, client_sender));
-                        distribute_state(&state).await?;
+                        state.set_client_number(&source, new_number);
+                        state.distribute().await?;
                     }
 
                     Err(e) => {
-                        let message = format!("{}", e);
-                        client_sender.send(ClientMessage::Error { message }).await?;
+                        let message = format!("{}\n", e);
+                        state.send_error_to_client(&source, &message).await?;
                     }
                 };
             }
         }
     }
     Ok(())
-}
-
-async fn distribute_state(state: &State) -> Result<()> {
-    for client_state in state.clone().values_mut() {
-        client_state
-            .1
-            .send(ClientMessage::StateUpdate {
-                new_state: state.clone(),
-            })
-            .await?;
-    }
-    Ok(())
-}
-
-fn state_to_string(state: &State) -> String {
-    let mut s = String::new();
-    for (key, value) in state {
-        let part = format!("{} -> {}\n", key, value.0);
-        s.push_str(&part)
-    }
-    return s;
 }
 
 fn main() -> Result<()> {
