@@ -4,92 +4,21 @@ use async_std::prelude::*;
 use async_std::task;
 use futures::channel::mpsc;
 use futures::sink::SinkExt;
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
+
+mod client_message;
+mod client_state;
+mod state;
+mod state_keeper_message;
+
+use client_message::ClientMessage;
+use client_state::ClientState;
+use state::State;
+use state_keeper_message::StateKeeperMessage;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Sender<T> = futures::channel::mpsc::UnboundedSender<T>;
 type Receiver<T> = futures::channel::mpsc::UnboundedReceiver<T>;
-
-#[derive(Clone)]
-struct State {
-    clients: HashMap<SocketAddr, (i64, Sender<ClientMessage>)>,
-}
-
-impl State {
-    fn new() -> Self {
-        State {
-            clients: HashMap::new(),
-        }
-    }
-
-    fn add_client(&mut self, address: SocketAddr, sender: Sender<ClientMessage>) {
-        self.clients.insert(address, (0, sender));
-    }
-
-    fn remove_client(&mut self, address: &SocketAddr) {
-        self.clients.remove(address);
-    }
-
-    fn set_client_number(&mut self, client_address: &SocketAddr, new_number: i64) {
-        self.clients
-            .entry(*client_address)
-            .and_modify(|e| e.0 = new_number);
-    }
-
-    async fn send_error_to_client(
-        &mut self,
-        client_address: &SocketAddr,
-        message: &str,
-    ) -> Result<()> {
-        if let Some(client) = self.clients.get_mut(client_address) {
-            let message = message.to_string();
-            client.1.send(ClientMessage::Error { message }).await?;
-        }
-        Ok(())
-    }
-
-    async fn distribute(&self) -> Result<()> {
-        for client_state in self.clients.clone().values_mut() {
-            client_state
-                .1
-                .send(ClientMessage::StateUpdate {
-                    new_state: self.clone(),
-                })
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-impl std::fmt::Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for (key, value) in &self.clients {
-            writeln!(f, "{} -> {}", key, value.0)?;
-        }
-        Ok(())
-    }
-}
-
-enum ClientMessage {
-    StateUpdate { new_state: State },
-    Error { message: String },
-}
-
-enum StateKeeperMessage {
-    NewClient {
-        stream: Arc<TcpStream>,
-        sender: Sender<ClientMessage>,
-    },
-    ClientGone {
-        address: SocketAddr,
-    },
-    Message {
-        source: SocketAddr,
-        text: String,
-    },
-}
 
 async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
     let (mut state_keeper_sender, state_keeper_receiver) = mpsc::unbounded();
@@ -135,7 +64,7 @@ async fn client_receiver_loop(
         state_keeper_sender.send(message).await?;
     }
     state_keeper_sender
-        .send(StateKeeperMessage::ClientGone { address: address })
+        .send(StateKeeperMessage::ClientGone { address })
         .await?;
     Ok(())
 }
@@ -161,7 +90,7 @@ async fn client_sender_loop(
             }
         }
 
-        counter = counter + 1;
+        counter += 1;
     }
 
     Ok(())
