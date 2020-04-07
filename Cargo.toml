@@ -1,0 +1,9 @@
+[package]
+name = "multinet"
+version = "0.1.0"
+authors = ["Peter Allin <peter@peca.dk>"]
+edition = "2018"
+
+[dependencies]
+async-std = "1"
+futures = "0.3"
